@@ -16,10 +16,11 @@ import os
 import re
 import stat
 import sys
+import uuid
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import urljoin
+from typing import Any, Callable, Dict, Iterable, List, Optional
+from urllib.parse import parse_qs, urljoin, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
@@ -27,6 +28,8 @@ import requests
 
 PORTAL_URL = "https://myportal.hkust-gz.edu.cn/"
 PORTAL_ORIGIN = "https://myportal.hkust-gz.edu.cn"
+TWO_FA_ORIGIN = "https://2fa.hkust-gz.edu.cn"
+TWO_FA_API = f"{TWO_FA_ORIGIN}/api/2fa-portal"
 CATEGORY_URL = f"{PORTAL_ORIGIN}/calendar/mgr/api/category/list.rst"
 CALENDAR_URL = f"{PORTAL_ORIGIN}/calendar/mgr/api/hkust/calendarList.rst"
 try:
@@ -122,6 +125,7 @@ class PortalCalendarClient:
     def __init__(self, session: Optional[requests.Session] = None, *, session_path: Path = DEFAULT_SESSION_PATH):
         self.session = session or requests.Session()
         self.session_path = Path(session_path).expanduser()
+        self._two_fa_session_id: Optional[str] = None
         if hasattr(self.session, "headers"):
             self.session.headers.update({"User-Agent": "SenseBridge-HKUST-Portal/0.1"})
 
@@ -149,6 +153,142 @@ class PortalCalendarClient:
             # Windows ACLs govern access; chmod is best effort there.
             pass
 
+    @staticmethod
+    def _json_response(response: Any) -> Any:
+        """Decode a JSON response while keeping the fake-session tests simple."""
+        try:
+            return response.json()
+        except (AttributeError, ValueError, TypeError):
+            try:
+                return json.loads(response.text)
+            except (AttributeError, TypeError, json.JSONDecodeError) as exc:
+                raise PortalCalendarError("2FA 接口返回的 JSON 无法解析") from exc
+
+    @staticmethod
+    def _find_value(payload: Any, names: Iterable[str]) -> Optional[Any]:
+        wanted = set(names)
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if key in wanted and value not in (None, "", []):
+                    return value
+            for value in payload.values():
+                found = PortalCalendarClient._find_value(value, names)
+                if found is not None:
+                    return found
+        elif isinstance(payload, list):
+            for value in payload:
+                found = PortalCalendarClient._find_value(value, names)
+                if found is not None:
+                    return found
+        return None
+
+    @staticmethod
+    def _process_id_from_url(url: str) -> Optional[str]:
+        parsed = urlparse(url)
+        fragment = parsed.fragment
+        if "?" not in fragment:
+            return None
+        query = fragment.split("?", 1)[1]
+        return parse_qs(query).get("processId", [None])[0]
+
+    def _two_fa_headers(self) -> Dict[str, str]:
+        if not self._two_fa_session_id:
+            self._two_fa_session_id = str(uuid.uuid4())
+        return {"User-Session-ID": self._two_fa_session_id}
+
+    def complete_two_factor(
+        self,
+        two_fa_url: str,
+        *,
+        input_code: Optional[Callable[[str], str]] = None,
+    ) -> str:
+        """Complete the campus 2FA flow using a code typed by the user.
+
+        The code is held only in memory and is never written to the cookie jar,
+        logs, or process arguments. ``input_code`` is injectable for tests.
+        """
+        process_id = self._process_id_from_url(two_fa_url)
+        if not process_id:
+            raise PortalCalendarError("2FA 跳转地址缺少 processId")
+        headers = self._two_fa_headers()
+        contact_response = self.session.get(
+            f"{TWO_FA_API}/contact/get",
+            params={"processId": process_id},
+            headers=headers,
+            timeout=30,
+        )
+        contact_response.raise_for_status()
+        contact = self._json_response(contact_response)
+        verification_type = self._find_value(contact, ("verificationType", "type"))
+        if isinstance(verification_type, (dict, list)):
+            verification_type = None
+        phone = self._find_value(contact, ("phoneNumber",))
+        email = self._find_value(contact, ("personalEmail",))
+        # The campus frontend names these methods SMS and Email; the contact
+        # endpoint returns the corresponding values as phoneNumber/email.
+        if not verification_type:
+            verification_type = "SMS" if phone else "Email"
+        if str(verification_type).casefold() in {"sms", "phone", "phonenumber"}:
+            verification_type = "SMS"
+            recipient = phone
+        elif str(verification_type).casefold() in {"email", "personalemail"}:
+            verification_type = "Email"
+            recipient = email
+        else:
+            recipient = self._find_value(contact, ("personalEmail", "phoneNumber", "contact"))
+        if not recipient:
+            recipient = "已绑定的联系方式"
+        send_payload: Dict[str, str] = {
+            "processId": str(process_id),
+            "verificationType": str(verification_type),
+        }
+        if verification_type == "Email":
+            send_payload["personalEmail"] = str(recipient)
+        elif verification_type == "SMS":
+            send_payload["phoneNumber"] = str(recipient)
+        else:
+            # Some deployments return a custom type and expect the corresponding
+            # contact field in the request; preserve it when available.
+            send_payload[str(verification_type)] = str(recipient)
+        send_response = self.session.post(
+            f"{TWO_FA_API}/verification-code/send",
+            json=send_payload,
+            headers=headers,
+            timeout=30,
+        )
+        send_response.raise_for_status()
+        send_result = self._json_response(send_response)
+        error_message = self._find_value(send_result, ("message", "msg", "error"))
+        success = self._find_value(send_result, ("success",))
+        if success is False or (isinstance(send_result, dict) and send_result.get("code") not in (None, 0, "0", 200, "200")):
+            raise PortalCalendarError(str(error_message or "2FA 验证码发送失败"))
+        prompt = f"请输入发送到 {recipient} 的 6 位验证码："
+        if input_code is None and not sys.stdin.isatty():
+            raise PortalCalendarError("学校要求输入验证码，请在交互式终端重新登录")
+        try:
+            code = (input_code or getpass.getpass)(prompt).strip()
+        except (EOFError, KeyboardInterrupt) as exc:
+            raise PortalCalendarError("验证码输入已取消或不可用") from exc
+        if not re.fullmatch(r"\d{6}", code):
+            raise PortalCalendarError("验证码必须是 6 位数字")
+        verify_response = self.session.post(
+            f"{TWO_FA_API}/verification-code/verify",
+            json={"processId": str(process_id), "verificationCode": code},
+            headers=headers,
+            timeout=30,
+        )
+        verify_response.raise_for_status()
+        verify_result = self._json_response(verify_response)
+        jump_to = self._find_value(verify_result, ("jumpTo", "jump_to"))
+        if not jump_to:
+            message = self._find_value(verify_result, ("message", "msg", "error"))
+            raise PortalCalendarError(str(message or "2FA 验证码校验失败或已过期"))
+        continuation = self.session.get(urljoin(TWO_FA_ORIGIN, str(jump_to)), timeout=30, allow_redirects=True)
+        continuation.raise_for_status()
+        if "myportal.hkust-gz.edu.cn" not in continuation.url:
+            raise PortalCalendarError("2FA 已校验，但未能回到 MyPortal")
+        return continuation.url
+
     def login(self, username: str, password: str) -> None:
         response = self.session.get(PORTAL_URL, timeout=30, allow_redirects=True)
         response.raise_for_status()
@@ -165,8 +305,12 @@ class PortalCalendarClient:
         result = self.session.post(action, data=payload, timeout=30, allow_redirects=True)
         result.raise_for_status()
         if "2fa.hkust-gz.edu.cn" in result.url:
-            raise PortalCalendarError("账号密码已通过，但学校要求完成二次验证（2FA）；请先在浏览器完成验证后再重试")
-        if "myportal.hkust-gz.edu.cn" not in result.url or "Login" in result.url:
+            final_url = self.complete_two_factor(result.url)
+            # Keep the validation below meaningful after the extra redirect.
+            result_url = final_url
+        else:
+            result_url = result.url
+        if "myportal.hkust-gz.edu.cn" not in result_url or "Login" in result_url:
             raise PortalCalendarError(
                 f"学校 SSO 登录未成功，请检查账号、密码或额外验证（HTTP {result.status_code}）"
             )

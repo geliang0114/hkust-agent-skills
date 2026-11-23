@@ -92,6 +92,40 @@ class PortalCalendarTests(unittest.TestCase):
         self.assertEqual(kwargs["data"]["Password"], "secret")
         self.assertEqual(kwargs["data"]["__RequestVerificationToken"], "csrf")
 
+    def test_two_factor_prompts_and_follows_jump(self):
+        session = FakeSession(
+            [
+                FakeResponse('{"data":{"verificationType":"personalEmail","personalEmail":"l***@hkust-gz.edu.cn"}}', "https://2fa.hkust-gz.edu.cn/"),
+                FakeResponse('{"code":0,"message":"sent"}', "https://2fa.hkust-gz.edu.cn/"),
+                FakeResponse('{"code":0,"data":{"jumpTo":"/complete?processId=abc"}}', "https://2fa.hkust-gz.edu.cn/"),
+                FakeResponse("ok", "https://myportal.hkust-gz.edu.cn/commonback"),
+            ]
+        )
+        client = PortalCalendarClient(session=session)
+        final_url = client.complete_two_factor(
+            "https://2fa.hkust-gz.edu.cn/#/2fa/home?processId=abc",
+            input_code=lambda prompt: "123456",
+        )
+        self.assertIn("myportal.hkust-gz.edu.cn", final_url)
+        self.assertEqual(session.calls[1][2]["json"]["verificationType"], "Email")
+        self.assertEqual(session.calls[2][2]["json"]["verificationCode"], "123456")
+        self.assertEqual(session.calls[1][2]["headers"], session.calls[2][2]["headers"])
+
+    def test_two_factor_rejects_invalid_code_without_verifying(self):
+        session = FakeSession(
+            [
+                FakeResponse('{"data":{"verificationType":"phoneNumber","phoneNumber":"***1234"}}'),
+                FakeResponse('{"code":0}'),
+            ]
+        )
+        client = PortalCalendarClient(session=session)
+        with self.assertRaisesRegex(Exception, "6 位数字"):
+            client.complete_two_factor(
+                "https://2fa.hkust-gz.edu.cn/#/2fa/home?processId=abc",
+                input_code=lambda prompt: "12",
+            )
+        self.assertEqual(len(session.calls), 2)
+
     def test_list_events_queries_categories_and_calendar(self):
         category = 'categories({"result":{"data":[{"teamCategoryVOS":[{"id":-2,"calendarCateName":"My Course"}]}]}})'
         calendar = 'calendar([{"events":[{"beginTime":"2026-11-24 09:00:00","endTime":"2026-11-24 10:00:00","schedule":{"title":"A","cateGory":{"id":-2}}}]}])'

@@ -37,3 +37,14 @@ The calendar request uses UTC ISO 8601 timestamps derived from `Asia/Shanghai` d
   }
 }
 ```
+
+## 2FA 接口（登录流程内部使用）
+
+当 SSO 将浏览器重定向到 `https://2fa.hkust-gz.edu.cn/#/2fa/home?processId=<id>` 时，连接器在同一个 HTTP 会话中调用：
+
+- `GET /api/2fa-portal/contact/get?processId=<id>`：读取可用验证方式及脱敏联系方式。
+- `POST /api/2fa-portal/verification-code/send`：发送验证码，JSON 包含 `processId`、`verificationType` 和对应的 `personalEmail` 或 `phoneNumber`。
+- `POST /api/2fa-portal/verification-code/verify`：校验 JSON 中的 `processId` 和 `verificationCode`。
+- 校验成功后跟随响应中的 `jumpTo` 地址回到 MyPortal。
+
+这些接口带有当前流程生成的 `User-Session-ID` 请求头。连接器不会记录验证码或完整联系方式；学校接口字段若有调整，应先更新模拟测试再修改解析逻辑。
