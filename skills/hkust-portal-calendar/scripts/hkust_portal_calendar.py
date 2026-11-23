@@ -20,7 +20,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urljoin
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
@@ -29,7 +29,10 @@ PORTAL_URL = "https://myportal.hkust-gz.edu.cn/"
 PORTAL_ORIGIN = "https://myportal.hkust-gz.edu.cn"
 CATEGORY_URL = f"{PORTAL_ORIGIN}/calendar/mgr/api/category/list.rst"
 CALENDAR_URL = f"{PORTAL_ORIGIN}/calendar/mgr/api/hkust/calendarList.rst"
-TZ = ZoneInfo("Asia/Shanghai")
+try:
+    TZ = ZoneInfo("Asia/Shanghai")
+except ZoneInfoNotFoundError:  # Windows may not have the IANA tzdata package.
+    TZ = dt.timezone(dt.timedelta(hours=8), "Asia/Shanghai")
 DEFAULT_SESSION_PATH = Path(os.environ.get("HKUST_PORTAL_SESSION", "~/.sensebridge/hkust_portal_cookies.json")).expanduser()
 
 
@@ -140,7 +143,11 @@ class PortalCalendarClient:
             for c in self.session.cookies
         ]
         self.session_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.chmod(self.session_path, stat.S_IRUSR | stat.S_IWUSR)
+        try:
+            os.chmod(self.session_path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            # Windows ACLs govern access; chmod is best effort there.
+            pass
 
     def login(self, username: str, password: str) -> None:
         response = self.session.get(PORTAL_URL, timeout=30, allow_redirects=True)
@@ -158,7 +165,9 @@ class PortalCalendarClient:
         result = self.session.post(action, data=payload, timeout=30, allow_redirects=True)
         result.raise_for_status()
         if "myportal.hkust-gz.edu.cn" not in result.url or "Login" in result.url:
-            raise PortalCalendarError("学校 SSO 登录未成功，请检查账号、密码或额外验证")
+            raise PortalCalendarError(
+                f"学校 SSO 登录未成功，请检查账号、密码或额外验证（HTTP {result.status_code}）"
+            )
         self.save_session()
 
     def _get_jsonp(self, url: str, params: Dict[str, Any], callback: str) -> Any:

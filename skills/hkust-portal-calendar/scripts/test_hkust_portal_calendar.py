@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from hkust_portal_calendar import PortalCalendarClient, parse_jsonp, normalize_events
+from hkust_portal_calendar import PortalCalendarClient, parse_jsonp, normalize_events, TZ
 
 
 class FakeResponse:
@@ -85,10 +85,10 @@ class PortalCalendarTests(unittest.TestCase):
             ]
         )
         client = PortalCalendarClient(session=session)
-        client.login("example-user", "secret")
+        client.login("orenglouyang", "secret")
         method, _, kwargs = session.calls[1]
         self.assertEqual(method, "POST")
-        self.assertEqual(kwargs["data"]["Username"], "example-user")
+        self.assertEqual(kwargs["data"]["Username"], "orenglouyang")
         self.assertEqual(kwargs["data"]["Password"], "secret")
         self.assertEqual(kwargs["data"]["__RequestVerificationToken"], "csrf")
 
@@ -118,6 +118,12 @@ class PortalCalendarTests(unittest.TestCase):
             other = PortalCalendarClient(session=FakeSession([]), session_path=path)
             self.assertEqual(other.load_session(), True)
             self.assertEqual(other.session.cookies.get(".AspNetCore.Cookies"), "abc")
+
+    def test_fixed_timezone_fallback_has_china_offset(self):
+        self.assertEqual(
+            dt.datetime(2026, 11, 24, tzinfo=dt.timezone.utc).astimezone(TZ).utcoffset(),
+            dt.timedelta(hours=8),
+        )
 
 
 if __name__ == "__main__":
