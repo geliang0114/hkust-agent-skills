@@ -3,3 +3,10 @@ __pycache__/
 .env
 *cookies*.json
 *.token
+.env.*
+!.env.example
+node_modules/
+*.pem
+*.key
+*.token.json
+.outlook-mcp-tokens.json
