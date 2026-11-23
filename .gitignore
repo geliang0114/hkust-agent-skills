@@ -10,3 +10,4 @@ node_modules/
 *.key
 *.token.json
 .outlook-mcp-tokens.json
+*graph*token*.json
