@@ -6,7 +6,7 @@ adapter never accepts a password; provide a delegated Graph bearer token via
 GRAPH_ACCESS_TOKEN or GRAPH_TOKEN_FILE.
 """
 from __future__ import annotations
-import argparse, hashlib, html, json, os, sys
+import argparse, hashlib, html, json, os, sys, time
 from pathlib import Path
 from urllib.parse import quote
 from typing import Any, Dict, List, Optional
@@ -14,6 +14,7 @@ import requests
 
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 DEFAULT_SIGNATURE = ""
+PERMISSION_MODES = {"approval", "auto", "bypass"}
 
 class GraphError(RuntimeError): pass
 
@@ -26,12 +27,39 @@ def token() -> str:
         try:
             data=json.loads(p.read_text())
             value=str(data.get("access_token", "")).strip()
-            if value: return value
+            if value and (not data.get("expires_at") or data["expires_at"] > time.time()+120): return value
+            if data.get("refresh_token") and data.get("client_id"):
+                tenant=quote(str(data.get("tenant") or "organizations"),safe='')
+                response=requests.post(f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",data={"client_id":data["client_id"],"grant_type":"refresh_token","refresh_token":data["refresh_token"],"scope":"openid profile offline_access User.Read Mail.ReadWrite Mail.Send"},timeout=30)
+                refreshed=response.json()
+                if not response.ok or not refreshed.get("access_token"): raise GraphError("Microsoft 会话续期失败，请重新登录")
+                data.update(refreshed); data["expires_at"]=int(time.time())+int(refreshed.get("expires_in",3600))
+                # Preserve the previous file as a recoverable backup before replacement.
+                backup=p.with_name(p.name+'.previous.'+str(time.time_ns()))
+                import shutil
+                shutil.copy2(p,backup)
+                p.write_text(json.dumps(data),encoding="utf-8")
+                try: os.chmod(p,0o600)
+                except OSError: pass
+                return data["access_token"]
+            raise GraphError("Graph 令牌已过期，请重新登录")
         except (OSError, json.JSONDecodeError) as exc: raise GraphError(f"读取 Graph token 失败: {exc}") from exc
     raise GraphError("缺少 GRAPH_ACCESS_TOKEN 或 GRAPH_TOKEN_FILE；请先完成 Microsoft Graph OAuth 授权")
 
 def signature() -> str:
     return os.environ.get("GRAPH_SIGNATURE", DEFAULT_SIGNATURE)
+
+def permission_mode() -> str:
+    mode=os.environ.get("AGENT_PERMISSION_MODE", "approval").strip().lower()
+    if mode not in PERMISSION_MODES: raise GraphError("AGENT_PERMISSION_MODE 必须是 approval、auto 或 bypass")
+    return mode
+
+def require_write_permission(action: str, *, confirm: bool=False) -> None:
+    mode=permission_mode()
+    if mode == "bypass": return
+    if mode == "auto":
+        raise GraphError("auto 模式需要接入可信的 Review Agent 宿主；当前适配器尚未实现，操作未执行")
+    if not confirm: raise GraphError(f"{action} 需要用户审批")
 
 def request(method: str, path: str, *, params=None, body=None) -> Any:
     r=requests.request(method, GRAPH_ROOT+path, headers={"Authorization": f"Bearer {token()}", "Accept":"application/json", "Content-Type":"application/json"}, params=params, json=body, timeout=30)
@@ -70,8 +98,8 @@ def main(argv=None) -> int:
     l=sub.add_parser("list"); l.add_argument("--folder",default="inbox"); l.add_argument("--top",type=int,default=10)
     s=sub.add_parser("search"); s.add_argument("query"); s.add_argument("--top",type=int,default=10)
     r=sub.add_parser("read"); r.add_argument("id")
-    d=sub.add_parser("draft"); d.add_argument("--to",action="append",required=True); d.add_argument("--subject",required=True); d.add_argument("--body",required=True); d.add_argument("--cc",action="append",default=[]); d.add_argument("--no-signature",action="store_true")
-    u=sub.add_parser("update-draft"); u.add_argument("id"); u.add_argument("--to",action="append"); u.add_argument("--subject"); u.add_argument("--body"); u.add_argument("--cc",action="append"); u.add_argument("--no-signature",action="store_true")
+    d=sub.add_parser("draft"); d.add_argument("--to",action="append",required=True); d.add_argument("--subject",required=True); d.add_argument("--body",required=True); d.add_argument("--cc",action="append",default=[]); d.add_argument("--no-signature",action="store_true"); d.add_argument("--confirm",action="store_true")
+    u=sub.add_parser("update-draft"); u.add_argument("id"); u.add_argument("--to",action="append"); u.add_argument("--subject"); u.add_argument("--body"); u.add_argument("--cc",action="append"); u.add_argument("--no-signature",action="store_true"); u.add_argument("--confirm",action="store_true")
     v=sub.add_parser("review-draft"); v.add_argument("id")
     e=sub.add_parser("send"); e.add_argument("id"); e.add_argument("--confirm",action="store_true"); e.add_argument("--review-hash",required=True)
     a=p.parse_args(argv)
@@ -87,9 +115,11 @@ def main(argv=None) -> int:
             data=request("GET",f"/me/messages/{quote(a.id,safe='')}",params={"$select":"id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,bodyPreview,hasAttachments,isRead,webLink"})
             return emit("outlook.read_mail",data)
         if a.cmd=="draft":
+            require_write_permission("mail.draft.write",confirm=a.confirm)
             data=request("POST","/me/messages",body={"subject":a.subject,"body":{"contentType":"HTML","content":body_html(a.body,add_signature=not a.no_signature)},"toRecipients":recipients(a.to),"ccRecipients":recipients(a.cc)})
             return emit("outlook.create_draft",{"id":data.get("id"),"subject":data.get("subject"),"isDraft":True})
         if a.cmd=="update-draft":
+            require_write_permission("mail.draft.write",confirm=a.confirm)
             body={}
             if a.subject is not None: body["subject"]=a.subject
             if a.body is not None: body["body"]={"contentType":"HTML","content":body_html(a.body,add_signature=not a.no_signature)}
@@ -103,7 +133,7 @@ def main(argv=None) -> int:
             draft=get_draft(a.id)
             return emit("outlook.review_draft",{"draft":draft,"review_hash":draft_fingerprint(draft)})
         if a.cmd=="send":
-            if not a.confirm: raise GraphError("发送邮件是外部写操作；请在用户确认收件人、主题和正文后再次使用 --confirm")
+            require_write_permission("mail.send",confirm=a.confirm)
             draft=get_draft(a.id)
             if draft_fingerprint(draft)!=a.review_hash: raise GraphError("草稿在确认后发生变化，请重新预览并获得确认")
             request("POST",f"/me/messages/{quote(a.id,safe='')}/send")

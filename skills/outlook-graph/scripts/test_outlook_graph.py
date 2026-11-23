@@ -8,6 +8,15 @@ import outlook_graph as graph
 
 
 class GraphAdapterTests(unittest.TestCase):
+    def test_write_modes(self):
+        with patch.dict('os.environ', {'AGENT_PERMISSION_MODE':'approval'}):
+            with self.assertRaises(graph.GraphError): graph.require_write_permission('mail.draft.write')
+            graph.require_write_permission('mail.draft.write', confirm=True)
+        with patch.dict('os.environ', {'AGENT_PERMISSION_MODE':'auto'}):
+            with self.assertRaises(graph.GraphError): graph.require_write_permission('mail.draft.write', confirm=True)
+        with patch.dict('os.environ', {'AGENT_PERMISSION_MODE':'bypass'}):
+            graph.require_write_permission('mail.draft.write')
+
     def test_signature_is_optional_and_escaped(self):
         with patch.dict('os.environ', {'GRAPH_SIGNATURE': 'Bridge <AI>'}):
             self.assertIn('Bridge &lt;AI&gt;', graph.body_html('hello'))

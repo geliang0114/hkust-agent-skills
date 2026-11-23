@@ -11,3 +11,4 @@ node_modules/
 *.token.json
 .outlook-mcp-tokens.json
 *graph*token*.json
+*graph*token*.json.*
