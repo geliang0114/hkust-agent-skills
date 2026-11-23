@@ -164,6 +164,8 @@ class PortalCalendarClient:
         payload.update({"Username": username, "Password": password, "button": "login", "RememberLogin": "false"})
         result = self.session.post(action, data=payload, timeout=30, allow_redirects=True)
         result.raise_for_status()
+        if "2fa.hkust-gz.edu.cn" in result.url:
+            raise PortalCalendarError("账号密码已通过，但学校要求完成二次验证（2FA）；请先在浏览器完成验证后再重试")
         if "myportal.hkust-gz.edu.cn" not in result.url or "Login" in result.url:
             raise PortalCalendarError(
                 f"学校 SSO 登录未成功，请检查账号、密码或额外验证（HTTP {result.status_code}）"
